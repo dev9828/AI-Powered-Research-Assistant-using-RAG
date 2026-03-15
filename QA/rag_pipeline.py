@@ -4,9 +4,10 @@ from pathlib import Path
 from dotenv import load_dotenv
 from langchain_community.vectorstores import FAISS
 from langchain_community.embeddings import HuggingFaceEmbeddings
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_classic.chains import ConversationalRetrievalChain
-from langchain_classic.memory import ConversationBufferMemory
+from langchain_openai import ChatOpenAI
+from langchain_core.prompts import PromptTemplate
+from langchain_core.runnables import RunnablePassthrough
+from langchain_core.output_parsers import StrOutputParser
 
 from loaders.all_loaders import custom_loader
 from utils.splitter import split_text as custom_text_splitter
@@ -22,18 +23,15 @@ DATA_DIR = ROOT_DIR / "data"
 
 class ConversationalRAG:
     def __init__(self):
-        # Expect GEMINI_API_KEY (configured in Streamlit / Vercel or local .env)
-        gemini_key = os.getenv("GEMINI_API_KEY")
-        if not gemini_key:
-            raise ValueError("GEMINI_API_KEY not found in environment")
-
-        # langchain-google-genai expects GOOGLE_API_KEY to be set
-        os.environ["GOOGLE_API_KEY"] = gemini_key
+        # Expect OPENAI_API_KEY (configured in Streamlit / Vercel or local .env)
+        openai_key = os.getenv("OPENAI_API_KEY")
+        if not openai_key:
+            raise ValueError("OPENAI_API_KEY not found in environment")
 
         # Use local HuggingFace sentence-transformer embeddings (no external API)
         self.embedding = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-        self.llm = ChatGoogleGenerativeAI(temperature=0.5, model="gemini-2.5-flash")
-        self.memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True, output_key="answer")
+        self.llm = ChatOpenAI(api_key=openai_key, temperature=0.5, model="gpt-4o-mini")
+        self.conversation_history = []
 
         index_path = VECTORSTORE_DIR / "index.faiss"
         if index_path.exists():
@@ -46,12 +44,33 @@ class ConversationalRAG:
         self._create_qa_chain()
 
     def _create_qa_chain(self):
-        self.qa_chain = ConversationalRetrievalChain.from_llm(
-            llm=self.llm,
-            retriever=self.db.as_retriever(),
-            memory=self.memory,
-            return_source_documents=True,
-            output_key="answer"
+        """Create a RAG chain using LCEL (LangChain Expression Language)"""
+        # Simple RAG prompt template
+        template = """You are a helpful assistant that answers questions based on the provided context.
+        
+Context:
+{context}
+
+Question: {question}
+
+Answer:"""
+        
+        prompt = PromptTemplate.from_template(template)
+        
+        # Create a RAG chain using LCEL
+        def format_docs(docs):
+            return "\n\n".join(doc.page_content for doc in docs)
+        
+        self.retriever = self.db.as_retriever(search_kwargs={"k": 3})
+        
+        self.qa_chain = (
+            {
+                "context": self.retriever | (lambda x: format_docs(x)),
+                "question": RunnablePassthrough()
+            }
+            | prompt
+            | self.llm
+            | StrOutputParser()
         )
 
     def _build_index(self):
@@ -65,9 +84,32 @@ class ConversationalRAG:
     def rebuild_index(self):
         print("♻️ Rebuilding FAISS index...")
         self._build_index()
-        self.memory.clear()  # 🧠 Clear old conversation context
+        self.conversation_history = []  # Clear conversation context
         self._create_qa_chain()
         print("✅ Index rebuilt and memory cleared.")
 
     def ask(self, question: str):
-        return self.qa_chain.invoke({"question": question})
+        """Ask a question and get an answer based on the documents"""
+        try:
+            # Get source documents for reference
+            source_docs = self.retriever.invoke(question)
+            
+            # Get the answer from the chain
+            answer = self.qa_chain.invoke(question)
+            
+            # Store in conversation history
+            self.conversation_history.append({
+                "question": question,
+                "answer": answer
+            })
+            
+            return {
+                "answer": answer,
+                "source_documents": source_docs
+            }
+        except Exception as e:
+            print(f"Error in ask method: {e}")
+            return {
+                "answer": f"Error processing question: {str(e)}",
+                "source_documents": []
+            }
